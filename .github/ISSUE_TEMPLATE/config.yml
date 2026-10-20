@@ -1,0 +1,7 @@
+# Issue template chooser configuration.
+# Docs: https://docs.github.com/communities/using-templates-to-encourage-useful-issues/configuring-issue-templates-for-your-repository
+blank_issues_enabled: false
+contact_links:
+  - name: Project discussions
+    url: https://github.com/ORG/REPO/discussions
+    about: Use discussions for questions and ideas that are not bug reports or feature requests. Replace ORG/REPO with your repository path once the remote is configured.
