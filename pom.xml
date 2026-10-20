@@ -30,6 +30,12 @@
             <artifactId>spring-boot-starter-web</artifactId>
         </dependency>
 
+        <!-- Bean Validation for request field validation (@Valid, @NotBlank, @Email, ...). -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-validation</artifactId>
+        </dependency>
+
         <!-- Persistence layer (JPA). MySQL is the target database; H2 is used for tests. -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
