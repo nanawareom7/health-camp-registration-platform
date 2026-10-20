@@ -2,25 +2,24 @@
 
 A Spring Boot platform for registering participants in health camps, reviewing and approving registrations, and tracking participant status.
 
-> **This repository is at the initialization stage (Task 4).** It contains a minimal, buildable application skeleton plus project documentation, GitHub templates, and contribution guidelines. The full registration workflow is **planned** and is **not yet implemented**.
+> **Repository status:** The application skeleton and the participant registration endpoint (Feature 1) are implemented. Registration approval, participant listing, and CI/CD deployment are still **planned** (see the `docs/` folder).
 
 ## Status
 
 | Area | Status |
 | --- | --- |
-| Repository & build setup (Maven, Spring Boot) | Done (skeleton) |
+| Repository & build setup (Maven, Spring Boot) | Done |
 | Application context smoke test (JUnit 5) | Done |
-| Participant registration workflow | Planned |
+| Participant registration & validation (Feature 1) | Done |
 | Registration approval & confirmation | Planned |
 | Participant listing & status tracking | Planned |
-| REST API | Planned |
 | CI/CD & deployment | Planned |
 
-All "Planned" items are described in the `docs/` folder and tracked as GitHub issues. They are intentionally not implemented in this task.
+Planned items are described in the `docs/` folder and tracked as GitHub issues.
 
 ## Planned MVP features
 
-1. **Participant registration and validation** — capture participant details for a health camp and validate required fields.
+1. **Participant registration and validation** — capture participant details for a health camp and validate required fields. (Implemented as Feature 1.)
 2. **Registration approval and confirmation** — organizers review submissions, approve or reject them, and confirm to participants.
 3. **Participant listing and status tracking** — list participants per camp and track each registration's status.
 
@@ -29,7 +28,7 @@ See `docs/SRS.md` for the full requirements, `docs/api-documentation.md` for the
 ## Tech stack
 
 - **Language:** Java 17 (LTS)
-- **Framework:** Spring Boot 3.5.x (Spring Web, Spring Data JPA)
+- **Framework:** Spring Boot 3.5.x (Spring Web, Spring Data JPA, Bean Validation)
 - **Build:** Maven
 - **Database:** MySQL (H2 in-memory for automated tests)
 - **Testing:** JUnit 5 (Jupiter), Spring Boot Test, AssertJ, Mockito (provided by `spring-boot-starter-test`)
@@ -51,10 +50,10 @@ health-camp-registration-platform/
 ├── docs/                          # SRS, architecture, data model, API docs, deployment
 ├── src/
 │   ├── main/
-│   │   ├── java/com/healthcamp/   # Application source (main class only for now)
+│   │   ├── java/com/healthcamp/   # Application + registration (entity, service, controller, DTOs, handler)
 │   │   └── resources/             # application.yml (safe placeholders)
 │   └── test/
-│       ├── java/com/healthcamp/   # JUnit 5 tests
+│       ├── java/com/healthcamp/   # JUnit 5 tests (context + registration)
 │       └── resources/             # application-test.yml (H2)
 ├── CONTRIBUTING.md
 ├── README.md
@@ -82,6 +81,19 @@ health-camp-registration-platform/
    $env:DB_USERNAME="your_user"
    $env:DB_PASSWORD="your_password"
    ```
+4. Create the `registrations` table (only needed to run the app; tests use H2 and create the schema automatically). The app uses `ddl-auto: none`, so the table must exist:
+   ```sql
+   USE health_camp_db;
+   CREATE TABLE IF NOT EXISTS registrations (
+       id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+       full_name VARCHAR(255) NOT NULL,
+       email VARCHAR(255) NOT NULL,
+       phone VARCHAR(255) NOT NULL,
+       preferred_camp_date DATE NOT NULL,
+       status VARCHAR(255) NOT NULL,
+       created_at TIMESTAMP NOT NULL
+   ) ENGINE=InnoDB;
+   ```
 
 ## Build and test commands
 
@@ -92,11 +104,75 @@ mvn clean package
 # Run tests only
 mvn test
 
-# Run the application (requires MySQL configured via env vars)
+# Run the application (requires MySQL configured via env vars + the registrations table)
 mvn spring-boot:run
 ```
 
 > Tests run against an in-memory H2 database, so MySQL is **not** required to run `mvn test`.
+
+## Registration API (Feature 1)
+
+The registration endpoint is implemented and tested.
+
+### POST /api/v1/registrations
+
+Registers a participant for a health camp. Creates a registration with status `PENDING`.
+
+Request body:
+```json
+{
+  "fullName": "Jane Doe",
+  "email": "jane@example.com",
+  "phone": "+919876543210",
+  "preferredCampDate": "2026-10-28"
+}
+```
+
+Field rules:
+
+| Field | Rule |
+| --- | --- |
+| `fullName` | Required, not blank. |
+| `email` | Required, valid email format. |
+| `phone` | Required, 7-20 digits; hyphens/spaces allowed; optional leading `+`. |
+| `preferredCampDate` | Required, ISO date (`yyyy-MM-dd`), must be a future date. |
+
+Success response `201 Created`:
+```json
+{
+  "id": 1,
+  "fullName": "Jane Doe",
+  "email": "jane@example.com",
+  "phone": "+919876543210",
+  "preferredCampDate": "2026-10-28",
+  "status": "PENDING",
+  "createdAt": "2026-10-20T12:00:00Z"
+}
+```
+A `Location` header is set to `/api/v1/registrations/{id}`.
+
+Validation error response `400 Bad Request`:
+```json
+{
+  "timestamp": "2026-10-20T12:00:00Z",
+  "status": 400,
+  "error": "Bad Request",
+  "message": "Validation failed",
+  "errors": [
+    { "field": "email", "message": "Email must be a valid email address" },
+    { "field": "phone", "message": "Phone must be 7-20 digits; hyphens and spaces allowed; optional leading '+'" }
+  ]
+}
+```
+
+### Try it
+
+After starting the app (see Setup and Build above):
+```bash
+curl -i -X POST http://localhost:8080/api/v1/registrations \
+  -H "Content-Type: application/json" \
+  -d '{"fullName":"Jane Doe","email":"jane@example.com","phone":"+919876543210","preferredCampDate":"2026-10-28"}'
+```
 
 ## Deployment overview
 
