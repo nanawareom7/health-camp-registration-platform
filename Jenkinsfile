@@ -6,33 +6,45 @@
 //   DEPLOY_PORT  — HTTP port the application will listen on (default: 8081)
 //   DEPLOY_DIR   — Local directory to copy the JAR into before launching
 //
-// Environment variables expected to be configured in Jenkins credentials /
-// environment (never hard-coded here):
+// Environment variables to configure in Jenkins (Manage Jenkins → Credentials
+// or Global properties → Environment variables). Never hard-coded here:
 //   DB_URL        — JDBC connection string for MySQL
 //   DB_USERNAME   — Database username
 //   DB_PASSWORD   — Database password
 //
-// Health-check note
-// -----------------
+// ─── WHY THE PREVIOUS PIPELINE FAILED ────────────────────────────────────────
+// Jenkins on Windows runs as a Windows Service and uses a Win32 Job Object to
+// track every process spawned during a build. When the pipeline finishes (or is
+// aborted) Jenkins calls its "Process Tree Killer" which terminates ALL processes
+// that belong to that Job Object — including children started with
+// `cmd /c start /b` or `Start-Process -WindowStyle Hidden`.
+//
+// The Spring Boot app therefore started, bound port 8081, printed "Started", and
+// was then killed by Jenkins the moment the pipeline completed, making the port
+// unreachable immediately after the pipeline reported SUCCESS.
+//
+// ─── FIX: wmic process call create ──────────────────────────────────────────
+// `wmic process call create "<command>"` creates a new process that is NOT
+// associated with the calling process's Job Object.  Jenkins cannot track or
+// kill it.  The application survives after the pipeline finishes.
+//
+// ─── HEALTH CHECK STRATEGY ──────────────────────────────────────────────────
 // The application has NO /actuator/health endpoint (spring-boot-starter-actuator
-// is not on the classpath). The only mapped route is POST /api/v1/registrations,
-// which requires a request body and persists data — unsuitable for polling.
-// The bounded startup check therefore uses a TCP-connect test
-// (Test-NetConnection -Port) which verifies that the JVM has bound the port
-// and the HTTP listener is accepting connections. This is reliable for startup
-// detection without side effects. To switch to an HTTP health check, add
-// spring-boot-starter-actuator to pom.xml and change the health-check block.
+// is absent from pom.xml). The available endpoint is POST /api/v1/registrations
+// (requires a body, writes to DB — not suitable for polling).
+//
+// Health check used: HTTP GET to the root path ( / ).
+// Spring Boot returns 404 for an unmapped root path, but that 404 comes from
+// the running application's DispatcherServlet — which proves the server is up.
+// curl.exe --fail-with-body would reject it; instead we accept any HTTP response
+// (including 404) as proof the server is alive, and only treat a connection-
+// refused / timeout as a failure.  This avoids side effects and DB writes.
 // ============================================================================
 
 pipeline {
 
-    // Run on any available Windows agent. Change the label to match your
-    // Jenkins node configuration (e.g. agent { label 'windows' }).
     agent any
 
-    // -------------------------------------------------------------------------
-    // Build parameters — visible in Jenkins "Build with Parameters" UI
-    // -------------------------------------------------------------------------
     parameters {
         string(
             name: 'DEPLOY_PORT',
@@ -46,29 +58,23 @@ pipeline {
         )
     }
 
-    // -------------------------------------------------------------------------
-    // Pipeline-wide environment
-    // -------------------------------------------------------------------------
     environment {
         JAR_NAME     = 'health-camp-registration-platform-0.0.1-SNAPSHOT.jar'
         JAR_PATH     = "target\\${JAR_NAME}"
-        STARTUP_WAIT = '60'   // seconds to wait for the port to become reachable
+        STARTUP_WAIT = '60'
     }
 
     options {
         buildDiscarder(logRotator(numToKeepStr: '10'))
-        timeout(time: 15, unit: 'MINUTES')
+        timeout(time: 20, unit: 'MINUTES')
         timestamps()
     }
 
-    // =========================================================================
-    // STAGES
-    // =========================================================================
     stages {
 
-        // ---------------------------------------------------------------------
+        // ─────────────────────────────────────────────────────────────────────
         // Stage 1 — Checkout
-        // ---------------------------------------------------------------------
+        // ─────────────────────────────────────────────────────────────────────
         stage('Checkout') {
             steps {
                 echo "==> Checking out branch: ${env.GIT_BRANCH ?: 'configured branch'}"
@@ -77,41 +83,41 @@ pipeline {
             }
         }
 
-        // ---------------------------------------------------------------------
-        // Stage 2 — Build  (compile + test)
-        // ---------------------------------------------------------------------
+        // ─────────────────────────────────────────────────────────────────────
+        // Stage 2 — Build (compile + test)
+        // ─────────────────────────────────────────────────────────────────────
         stage('Build') {
             steps {
-                echo '==> Running mvn clean verify (compiles, runs all tests)'
+                echo '==> Running mvn clean verify (compiles + JUnit 5 tests against H2)'
                 bat 'mvn clean verify --batch-mode --no-transfer-progress'
             }
             post {
                 failure {
-                    echo 'BUILD FAILED — check the Maven output above for compiler errors or test failures.'
+                    echo 'BUILD FAILED — check Maven output for compile errors or test failures.'
                 }
             }
         }
 
-        // ---------------------------------------------------------------------
+        // ─────────────────────────────────────────────────────────────────────
         // Stage 3 — Package verification
-        // ---------------------------------------------------------------------
+        // ─────────────────────────────────────────────────────────────────────
         stage('Package') {
             steps {
-                echo "==> Verifying JAR exists at: ${env.JAR_PATH}"
+                echo "==> Verifying JAR exists: ${env.JAR_PATH}"
                 bat """
                     IF NOT EXIST "%WORKSPACE%\\${env.JAR_PATH}" (
-                        echo ERROR: Expected JAR not found at %WORKSPACE%\\${env.JAR_PATH}
+                        echo ERROR: JAR not found at %WORKSPACE%\\${env.JAR_PATH}
                         exit /b 1
                     )
-                    echo JAR found:
+                    echo JAR verified:
                     dir "%WORKSPACE%\\${env.JAR_PATH}"
                 """
             }
         }
 
-        // ---------------------------------------------------------------------
+        // ─────────────────────────────────────────────────────────────────────
         // Stage 4 — Deploy
-        // ---------------------------------------------------------------------
+        // ─────────────────────────────────────────────────────────────────────
         stage('Deploy') {
             steps {
                 script {
@@ -123,198 +129,208 @@ pipeline {
                     def logFile    = "${deployDir}\\app.log"
                     def logFileErr = "${deployDir}\\app-err.log"
                     def pidFile    = "${deployDir}\\app.pid"
-                    def launchBat  = "${deployDir}\\launch.bat"
 
-                    // ----------------------------------------------------------
-                    // 4-a  Create deployment directory
-                    // ----------------------------------------------------------
-                    echo "==> Ensuring deployment directory exists: ${deployDir}"
+                    // ── 4-a  Ensure deployment directory exists ───────────────
+                    echo "==> Creating deployment directory (if needed): ${deployDir}"
                     bat "IF NOT EXIST \"${deployDir}\" mkdir \"${deployDir}\""
 
-                    // ----------------------------------------------------------
-                    // 4-b  Stop any existing instance
+                    // ── 4-b  Stop any existing instance ──────────────────────
                     //
-                    // Strategy:
-                    //  1. If app.pid exists, kill that PID (our own prior launch).
-                    //  2. Also scan netstat for any LISTENING process on the port.
-                    //     Only processes whose image name is 'java.exe' are killed;
-                    //     this avoids terminating unrelated services on the same port.
-                    //     If a non-Java process owns the port, the pipeline fails with
-                    //     a clear error rather than killing something unrelated.
-                    // ----------------------------------------------------------
-                    echo "==> Stopping any existing instance on port ${deployPort}"
+                    // Reads app.pid written by a previous run of this pipeline.
+                    // Only kills processes whose name is java.exe to avoid
+                    // terminating unrelated services.  If the port is held by a
+                    // non-Java process the pipeline fails with a clear message.
+                    echo "==> Stopping any previous instance on port ${deployPort}"
                     powershell """
-\$port    = ${deployPort}
+\$port    = [int]${deployPort}
 \$pidFile = '${pidFile}'
 
+# ── Stop by PID file (our own previous launch) ──────────────────────────────
 if (Test-Path \$pidFile) {
-    \$storedPid = (Get-Content \$pidFile -ErrorAction SilentlyContinue | Select-Object -First 1).Trim()
-    if (\$storedPid -match '^[0-9]+\$') {
-        Write-Host "Found PID file — stopping PID \$storedPid"
-        try { Stop-Process -Id ([int]\$storedPid) -Force -ErrorAction SilentlyContinue } catch {}
-        Start-Sleep -Seconds 2
+    \$stored = (Get-Content \$pidFile -Raw).Trim()
+    if (\$stored -match '^[0-9]+\$') {
+        \$oldPid = [int]\$stored
+        \$p = Get-Process -Id \$oldPid -ErrorAction SilentlyContinue
+        if (\$p -and \$p.Name -eq 'java') {
+            Write-Host "Stopping previous java.exe PID \$oldPid from pid file"
+            Stop-Process -Id \$oldPid -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 3
+        }
     }
     Remove-Item \$pidFile -Force -ErrorAction SilentlyContinue
 }
 
-\$netstatLines = netstat -ano | Select-String (":" + \$port + " ") | Where-Object { \$_ -match 'LISTENING' }
-foreach (\$line in \$netstatLines) {
-    if (\$line -match '([0-9]+)\$') {
+# ── Cross-check by port (catches processes started outside Jenkins) ──────────
+\$listeners = netstat -ano | Select-String ("TCP.*:\$port\\s.*LISTEN")
+foreach (\$line in \$listeners) {
+    if (\$line.Line -match '([0-9]+)\$') {
         \$netPid = [int]\$Matches[1]
-        if (\$netPid -gt 0) {
-            \$proc = Get-Process -Id \$netPid -ErrorAction SilentlyContinue
-            if (\$proc -and \$proc.Name -eq 'java') {
-                Write-Host "Stopping java.exe PID \$netPid on port \$port"
-                Stop-Process -Id \$netPid -Force -ErrorAction SilentlyContinue
-            } elseif (\$proc) {
-                Write-Error "Port \$port is occupied by '\$(\$proc.Name)' (PID \$netPid), which is NOT a Java process. Aborting to avoid killing an unrelated service."
-                exit 1
-            }
+        \$proc = Get-Process -Id \$netPid -ErrorAction SilentlyContinue
+        if (\$proc -and \$proc.Name -eq 'java') {
+            Write-Host "Stopping java.exe PID \$netPid on port \$port"
+            Stop-Process -Id \$netPid -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 2
+        } elseif (\$proc) {
+            Write-Error "Port \$port is held by '\$(\$proc.Name)' PID \$netPid — NOT a Java process. Aborting to avoid killing an unrelated service."
+            exit 1
         }
     }
 }
-Start-Sleep -Seconds 2
 Write-Host "Port \$port is clear."
 """
 
-                    // ----------------------------------------------------------
-                    // 4-c  Copy the newly built JAR
-                    // ----------------------------------------------------------
+                    // ── 4-c  Copy the freshly built JAR ──────────────────────
                     echo "==> Copying JAR to deployment directory"
                     bat "copy /Y \"${jarSrc}\" \"${jarDest}\""
 
-                    // ----------------------------------------------------------
-                    // 4-d  Write a self-contained launch.bat then execute it with
-                    //      `cmd /c start /b` so the JVM process is fully detached
-                    //      from the PowerShell console that Jenkins owns.
+                    // ── 4-d  Launch as a Jenkins-detached process ─────────────
                     //
-                    // WHY NOT Start-Process with -Redirect*?
-                    //   Start-Process -RedirectStandardOutput/-RedirectStandardError
-                    //   attaches internal stream readers that keep the PowerShell
-                    //   host alive until the child process exits — even without
-                    //   -Wait — causing the Jenkins step to block until the
-                    //   application stops (the original timeout bug).
+                    // ROOT CAUSE OF PREVIOUS FAILURE:
+                    // Jenkins on Windows runs as a Windows Service and assigns a
+                    // Win32 Job Object to every build.  Any process started with
+                    // `Start-Process` or `cmd /c start /b` inherits that Job
+                    // Object and is killed by Jenkins' Process Tree Killer when
+                    // the pipeline finishes — even if the step has already returned.
                     //
-                    // WHY launch.bat + `cmd /c start /b`?
-                    //   `cmd /c start /b` creates a new, detached console process.
-                    //   Jenkins has no handle on it and moves on immediately.
-                    //   The batch file redirects stdout/stderr to log files and
-                    //   inherits the env-var credentials set below.
-                    // ----------------------------------------------------------
-                    echo "==> Writing launch.bat"
-                    // Build the java argument string from the environment.
-                    // Credentials come from Jenkins env vars — never hard-coded.
+                    // FIX: `wmic process call create` launches the new process
+                    // outside the calling process's Job Object.  Jenkins cannot
+                    // track or terminate it.  The JVM survives after the pipeline.
+                    //
+                    // DB credentials are read from Jenkins environment variables.
+                    // They are never stored in this file.
+                    echo "==> Launching Spring Boot application (detached from Jenkins Job Object)"
                     powershell """
-\$launchBat  = '${launchBat}'
+\$deployDir  = '${deployDir}'
 \$jarDest    = '${jarDest}'
 \$logFile    = '${logFile}'
 \$logFileErr = '${logFileErr}'
+\$pidFile    = '${pidFile}'
 \$port       = ${deployPort}
 
-\$dbUrl  = if (\$env:DB_URL)      { "--spring.datasource.url=\$(\$env:DB_URL)" }      else { '' }
-\$dbUser = if (\$env:DB_USERNAME) { "--spring.datasource.username=\$(\$env:DB_USERNAME)" } else { '' }
-\$dbPass = if (\$env:DB_PASSWORD) { "--spring.datasource.password=\$(\$env:DB_PASSWORD)" } else { '' }
+# Build the argument list for java -jar
+\$args = "--server.port=\$port"
+if (\$env:DB_URL)      { \$args += " --spring.datasource.url=\$(\$env:DB_URL)" }
+if (\$env:DB_USERNAME) { \$args += " --spring.datasource.username=\$(\$env:DB_USERNAME)" }
+if (\$env:DB_PASSWORD) { \$args += " --spring.datasource.password=\$(\$env:DB_PASSWORD)" }
 
-\$args = ("--server.port=\$port \$dbUrl \$dbUser \$dbPass").Trim()
+# Rotate previous log so each run has a clean log to inspect
+if (Test-Path \$logFile)    { Move-Item \$logFile    "\$logFile.prev"    -Force }
+if (Test-Path \$logFileErr) { Move-Item \$logFileErr "\$logFileErr.prev" -Force }
 
-\$content = "@echo off`r`njava -jar `"\$jarDest`" \$args 1>`"\$logFile`" 2>`"\$logFileErr`""
-[System.IO.File]::WriteAllText(\$launchBat, \$content, [System.Text.Encoding]::ASCII)
-Write-Host "launch.bat written to \$launchBat"
+# wmic process call create spawns outside the Jenkins Job Object.
+# The process survives after the pipeline finishes.
+# Quoting: wmic requires the entire command as a single string.
+# cmd /c "java -jar ..." lets the shell handle redirection.
+\$wmicCmd = 'cmd /c java -jar "' + \$jarDest + '" ' + \$args + ' 1>"' + \$logFile + '" 2>"' + \$logFileErr + '"'
+Write-Host "Launching via wmic: \$wmicCmd"
+
+\$result = (wmic process call create \$wmicCmd) | Out-String
+Write-Host \$result
+
+# Extract PID from wmic output ("ProcessId = <n>")
+if (\$result -match 'ProcessId = ([0-9]+)') {
+    \$newPid = \$Matches[1].Trim()
+    \$newPid | Out-File \$pidFile -Encoding ASCII -Force
+    Write-Host "Process launched with PID \$newPid — recorded to app.pid"
+} else {
+    throw "wmic did not return a ProcessId. Launch may have failed. wmic output: \$result"
+}
 """
 
-                    echo "==> Launching application (detached) on port ${deployPort}"
-                    // Use cmd /c start /b to spawn a fully detached process.
-                    // /b suppresses a new console window.
-                    // wmic is used to capture the PID of the newly spawned java.exe
-                    // that appears on the configured port after startup.
-                    bat "cmd /c start /b \"\" \"${launchBat}\""
-
-                    // ----------------------------------------------------------
-                    // 4-e  Bounded health-check loop (TCP connect, 60 s max)
+                    // ── 4-e  Bounded health-check ─────────────────────────────
                     //
-                    // No /actuator/health exists in this application. A TCP connect
-                    // on the configured port is the correct readiness signal — it
-                    // proves the embedded Tomcat has bound and is accepting
-                    // connections. Test-NetConnection returns TcpTestSucceeded=$true
-                    // as soon as the port is open.
-                    //
-                    // The loop also monitors the java process via the PID file.
-                    // If the process disappears before the port opens, the log is
-                    // dumped and the pipeline fails immediately.
-                    // ----------------------------------------------------------
-                    echo "==> Waiting up to ${env.STARTUP_WAIT}s for port ${deployPort} to accept connections..."
+                    // No /actuator/health exists (actuator not on classpath).
+                    // Strategy: HTTP GET to / with curl.exe.
+                    //   - The embedded Tomcat returns 404 for an unmapped root path.
+                    //   - Any HTTP response (including 404) means the server is up.
+                    //   - curl.exe exit code 0 means a response was received.
+                    //   - curl.exe exit code 7 means connection refused (not up yet).
+                    // Additionally: verify the java PID is still alive each iteration
+                    // to fail fast if the process crashed.
+                    echo "==> Waiting up to ${env.STARTUP_WAIT}s for the application to accept HTTP requests..."
                     powershell """
-\$port       = ${deployPort}
-\$maxWait    = [int]${env.STARTUP_WAIT}
-\$interval   = 3
-\$elapsed    = 0
-\$logFile    = '${logFile}'
-\$logFileErr = '${logFileErr}'
-\$ready      = \$false
+\$port      = [int]${deployPort}
+\$maxWait   = [int]${env.STARTUP_WAIT}
+\$interval  = 3
+\$elapsed   = 0
+\$logFile   = '${logFile}'
+\$logErr    = '${logFileErr}'
+\$pidFile   = '${pidFile}'
+\$ready     = \$false
+
+# Read the PID we just wrote
+\$appPid = 0
+if (Test-Path \$pidFile) {
+    \$raw = (Get-Content \$pidFile -Raw).Trim()
+    if (\$raw -match '^[0-9]+\$') { \$appPid = [int]\$raw }
+}
 
 while (\$elapsed -lt \$maxWait) {
     Start-Sleep -Seconds \$interval
     \$elapsed += \$interval
 
-    \$tcp = Test-NetConnection -ComputerName 127.0.0.1 -Port \$port -WarningAction SilentlyContinue -ErrorAction SilentlyContinue
-    if (\$tcp.TcpTestSucceeded) {
+    # Fail fast: if the JVM has already exited, no point waiting
+    if (\$appPid -gt 0) {
+        \$alive = Get-Process -Id \$appPid -ErrorAction SilentlyContinue
+        if (-not \$alive) {
+            Write-Host "Process PID \$appPid has exited — application crashed."
+            break
+        }
+    }
+
+    # Attempt an HTTP GET to the root path.
+    # Any HTTP status (including 404 from DispatcherServlet) means Tomcat is up.
+    # curl.exe exit code 7 = connection refused; 0 = response received.
+    \$curlOut = & curl.exe -s -o NUL -w "%{http_code}" --max-time 4 --connect-timeout 3 "http://localhost:\$port/" 2>&1
+    if (\$LASTEXITCODE -eq 0 -and \$curlOut -match '^[0-9]{3}\$') {
+        Write-Host "  HTTP \$curlOut received from http://localhost:\$port/ — server is up."
         \$ready = \$true
         break
     }
 
-    # If no java process is listening or running at all, fail fast
-    \$anyJava = Get-Process java -ErrorAction SilentlyContinue
-    if (-not \$anyJava) {
-        Write-Host "No java.exe process found — application appears to have crashed."
-        break
-    }
-
-    Write-Host "  ... waiting (\$elapsed / \$maxWait s)"
+    Write-Host "  ... (\$elapsed / \$maxWait s) — last curl exit=\$LASTEXITCODE response='\$curlOut'"
 }
 
 if (-not \$ready) {
     Write-Host ""
-    Write-Host "=== APPLICATION FAILED TO START — stdout log ==="
-    if (Test-Path \$logFile)    { Get-Content \$logFile    -Tail 50 }
-    Write-Host "=== stderr log ==="
-    if (Test-Path \$logFileErr) { Get-Content \$logFileErr -Tail 30 }
-    throw "Application did not become reachable on port \$port within \$maxWait seconds."
+    Write-Host "══════════════════════════════════════════════"
+    Write-Host " APPLICATION FAILED TO BECOME REACHABLE"
+    Write-Host "══════════════════════════════════════════════"
+    Write-Host "--- stdout log (last 60 lines) ---"
+    if (Test-Path \$logFile) { Get-Content \$logFile -Tail 60 }
+    Write-Host "--- stderr log (last 30 lines) ---"
+    if (Test-Path \$logErr)  { Get-Content \$logErr  -Tail 30 }
+    throw "Application did not respond on http://localhost:\$port within \$maxWait seconds."
 }
 
-# Record PID for future cleanup runs
-\$javaPids = (netstat -ano | Select-String (":" + \$port + " ") | Where-Object { \$_ -match 'LISTENING' } | ForEach-Object { if (\$_ -match '([0-9]+)\$') { \$Matches[1] } }) | Select-Object -First 1
-if (\$javaPids) {
-    \$javaPids | Out-File '${pidFile}' -Encoding ASCII
-    Write-Host "PID \$javaPids recorded to app.pid"
-}
-
+# Re-read PID (may differ from wmic if app respawned)
 Write-Host ""
-Write-Host "SUCCESS: Application is accepting connections on port \$port"
-Write-Host "Base URL : http://localhost:\$port"
-Write-Host "API      : http://localhost:\$port/api/v1/registrations"
+Write-Host "══════════════════════════════════════════════"
+Write-Host " DEPLOYMENT SUCCESSFUL"
+Write-Host " Base URL : http://localhost:\$port/"
+Write-Host " API      : http://localhost:\$port/api/v1/registrations"
+Write-Host " Log      : ${logFile}"
+Write-Host "══════════════════════════════════════════════"
 """
                 }
             }
             post {
                 failure {
-                    echo 'DEPLOY FAILED — review the PowerShell output and log files in DEPLOY_DIR above.'
+                    echo 'DEPLOY FAILED — see PowerShell output and application log above for details.'
                 }
             }
         }
     }
 
-    // =========================================================================
-    // POST-PIPELINE ACTIONS
-    // =========================================================================
     post {
         always {
-            echo "Pipeline finished with result: ${currentBuild.currentResult}"
+            echo "Pipeline result: ${currentBuild.currentResult}"
         }
         success {
-            echo "PIPELINE SUCCEEDED. Application running on port ${params.DEPLOY_PORT} — http://localhost:${params.DEPLOY_PORT}"
+            echo "SUCCESS — Spring Boot running on http://localhost:${params.DEPLOY_PORT}/"
         }
         failure {
-            echo 'Pipeline FAILED. Review stage logs above for details.'
+            echo 'FAILED — review stage logs above.'
         }
     }
 }
