@@ -128,31 +128,31 @@ pipeline {
                     bat "IF NOT EXIST \"${deployDir}\" mkdir \"${deployDir}\""
 
                     // ----------------------------------------------------------
-                    // 4-b  Kill any existing instance that is using the port
-                    //      OR whose PID was recorded in app.pid from a prior run.
+                    // 4-b  Kill any existing instance using the port, or whose
+                    //      PID was recorded in app.pid from a prior run.
+                    //
+                    // NOTE: PowerShell backtick line-continuation is NOT used
+                    // inside Groovy triple-quoted strings because Groovy also
+                    // treats backslash as an escape character and rejects \`.
+                    // All multi-param calls are written on a single line.
                     // ----------------------------------------------------------
                     echo "==> Stopping any existing instance on port ${deployPort}"
                     powershell """
 \$port = ${deployPort}
 \$pidFile = '${pidFile}'
 
-# Try PID file first (most reliable)
 if (Test-Path \$pidFile) {
     \$storedPid = Get-Content \$pidFile -ErrorAction SilentlyContinue | Select-Object -First 1
-    if (\$storedPid -match '^\\d+\$') {
+    if (\$storedPid -match '^[0-9]+\$') {
         Write-Host "Stopping process from PID file: \$storedPid"
-        try {
-            Stop-Process -Id ([int]\$storedPid) -Force -ErrorAction SilentlyContinue
-            Start-Sleep -Seconds 2
-        } catch {}
+        try { Stop-Process -Id ([int]\$storedPid) -Force -ErrorAction SilentlyContinue; Start-Sleep -Seconds 2 } catch {}
     }
     Remove-Item \$pidFile -Force -ErrorAction SilentlyContinue
 }
 
-# Also check by port (catches processes started outside Jenkins)
 \$connections = netstat -ano | Select-String ":\$port " | Where-Object { \$_ -match 'LISTENING' }
 foreach (\$line in \$connections) {
-    if (\$line -match '(\\d+)\$') {
+    if (\$line -match '([0-9]+)\$') {
         \$netPid = [int]\$Matches[1]
         if (\$netPid -gt 0) {
             Write-Host "Killing PID \$netPid listening on port \$port"
@@ -172,8 +172,11 @@ Write-Host "Port \$port is now free."
 
                     // ----------------------------------------------------------
                     // 4-d  Launch the application as a background process.
-                    //      DB credentials are read from Jenkins environment /
-                    //      credentials — do NOT hard-code them here.
+                    //      DB credentials are read from the Jenkins environment —
+                    //      do NOT hard-code them here.
+                    //
+                    //      Start-Process is written on one line to avoid the
+                    //      Groovy/backslash-escape problem with PowerShell backticks.
                     // ----------------------------------------------------------
                     echo "==> Launching application on port ${deployPort}"
                     powershell """
@@ -186,19 +189,15 @@ Write-Host "Port \$port is now free."
 \$dbUser  = \$env:DB_USERNAME
 \$dbPass  = \$env:DB_PASSWORD
 
-\$javaArgs = @('-jar', \$jarDest, "--server.port=\$port")
-if (\$dbUrl)  { \$javaArgs += "--spring.datasource.url=\$dbUrl" }
-if (\$dbUser) { \$javaArgs += "--spring.datasource.username=\$dbUser" }
-if (\$dbPass) { \$javaArgs += "--spring.datasource.password=\$dbPass" }
+\$javaArgs = [System.Collections.Generic.List[string]]::new()
+\$javaArgs.Add('-jar')
+\$javaArgs.Add(\$jarDest)
+\$javaArgs.Add("--server.port=\$port")
+if (\$dbUrl)  { \$javaArgs.Add("--spring.datasource.url=\$dbUrl") }
+if (\$dbUser) { \$javaArgs.Add("--spring.datasource.username=\$dbUser") }
+if (\$dbPass) { \$javaArgs.Add("--spring.datasource.password=\$dbPass") }
 
-\$proc = Start-Process -FilePath 'java' \`
-                       -ArgumentList \$javaArgs \`
-                       -RedirectStandardOutput \$logFile \`
-                       -RedirectStandardError  ("\$logFile.err") \`
-                       -WorkingDirectory '${deployDir}' \`
-                       -PassThru \`
-                       -WindowStyle Hidden
-
+\$proc = Start-Process -FilePath 'java' -ArgumentList \$javaArgs -RedirectStandardOutput \$logFile -RedirectStandardError "\$logFile.err" -WorkingDirectory '${deployDir}' -PassThru -WindowStyle Hidden
 Write-Host "Application started with PID \$(\$proc.Id)"
 \$proc.Id | Out-File \$pidFile -Encoding ASCII
 """
@@ -209,21 +208,18 @@ Write-Host "Application started with PID \$(\$proc.Id)"
                     // ----------------------------------------------------------
                     echo "==> Waiting up to ${env.STARTUP_WAIT}s for port ${deployPort} to be ready..."
                     powershell """
-\$port      = ${deployPort}
-\$maxWait   = ${env.STARTUP_WAIT}
-\$interval  = 3
-\$elapsed   = 0
-\$logFile   = '${logFile}'
-\$ready     = \$false
+\$port     = ${deployPort}
+\$maxWait  = ${env.STARTUP_WAIT}
+\$interval = 3
+\$elapsed  = 0
+\$logFile  = '${logFile}'
+\$ready    = \$false
 
 while (\$elapsed -lt \$maxWait) {
     Start-Sleep -Seconds \$interval
     \$elapsed += \$interval
     \$listening = netstat -ano | Select-String ":\$port " | Where-Object { \$_ -match 'LISTENING' }
-    if (\$listening) {
-        \$ready = \$true
-        break
-    }
+    if (\$listening) { \$ready = \$true; break }
     Write-Host "  ... waiting (\$elapsed / \$maxWait s)"
 }
 
