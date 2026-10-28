@@ -190,3 +190,4 @@ See `CONTRIBUTING.md` for branch naming, commit message conventions, and pull re
 ## License
 
 Not yet selected. A `LICENSE` file will be added once the project owner chooses a license.
+njenkins CI trigger verification
