@@ -181,7 +181,92 @@ See `docs/deployment.md` for the full plan. In summary:
 - Build a runnable JAR: `mvn clean package`.
 - Run the JAR with environment-specific config: `java -jar target/health-camp-registration-platform-0.0.1-SNAPSHOT.jar`.
 - Recommended targets: a container image (Docker) deployed to a VM or a container platform; environment variables supply database and server settings.
-- CI (planned): run `mvn verify` on pushes and pull requests.
+- CI/CD: Implemented via the declarative `Jenkinsfile` at the project root (see below).
+
+---
+
+## Jenkins CI/CD Pipeline (Task 8)
+
+A declarative `Jenkinsfile` at the repository root defines a four-stage pipeline that builds, verifies, and deploys the Spring Boot JAR on a **Windows** Jenkins agent.
+
+### Pipeline prerequisites
+
+| Requirement | Details |
+| --- | --- |
+| Jenkins | 2.387+ (LTS recommended) with Pipeline plugin |
+| Java | JDK 17 on the Jenkins agent (`java` on PATH) |
+| Maven | 3.9+ on the Jenkins agent (`mvn` on PATH) |
+| Git | On the Jenkins agent PATH |
+| MySQL | Running and accessible to the agent (for runtime only; tests use H2) |
+| OS | Windows (pipeline uses `bat` and `powershell` steps) |
+
+### Jenkins job setup
+
+1. **New Item** → **Pipeline** → give it a name (e.g. `health-camp-pipeline`).
+2. Under **Pipeline** → **Definition** select **Pipeline script from SCM**.
+3. **SCM**: Git
+   - **Repository URL**: `https://github.com/nanawareom7/health-camp-registration-platform.git`
+   - **Branch Specifier**: `*/development` (or the branch you want to build)
+   - **Script Path**: `Jenkinsfile`
+4. Save and run **Build with Parameters** (the first run populates the parameter defaults).
+
+### Pipeline parameters
+
+| Parameter | Default | Description |
+| --- | --- | --- |
+| `DEPLOY_PORT` | `8081` | HTTP port the application listens on after deployment. Passed as `--server.port`. |
+| `DEPLOY_DIR` | `C:\Jenkins\deployments\health-camp` | Local directory where the JAR is copied and launched from. |
+
+### Jenkins credentials (database)
+
+DB credentials are **never** stored in the `Jenkinsfile`. Inject them as Jenkins environment variables or credentials:
+
+1. **Manage Jenkins → Credentials → Global → Add Credentials** (type: *Secret text*) for each:
+   - `DB_URL` — e.g. `jdbc:mysql://localhost:3306/health_camp_db?useSSL=false&serverTimezone=UTC&allowPublicKeyRetrieval=true`
+   - `DB_USERNAME` — database user
+   - `DB_PASSWORD` — database password
+2. Alternatively, set them as **global environment variables** under **Manage Jenkins → System → Global properties → Environment variables**. The pipeline reads them from the agent environment and passes them as `--spring.datasource.*` arguments to `java -jar`.
+
+### Pipeline stages
+
+| Stage | What it does |
+| --- | --- |
+| **Checkout** | Checks out the configured branch via `checkout scm`. |
+| **Build** | Runs `mvn clean verify --batch-mode` — compiles and runs all JUnit 5 tests against H2. Fails the pipeline on test or compile errors. |
+| **Package** | Verifies `target/health-camp-registration-platform-0.0.1-SNAPSHOT.jar` exists. Fails immediately if the JAR is absent. |
+| **Deploy** | Creates `DEPLOY_DIR` if needed; stops any prior instance (by PID file, then by netstat); copies JAR; launches `java -jar` with `--server.port=DEPLOY_PORT`; polls netstat every 3 s for up to 60 s until the port is `LISTENING`. Fails if the port never comes up. |
+
+### Deployment URL
+
+After a successful pipeline run:
+
+```
+http://localhost:<DEPLOY_PORT>
+```
+
+Default (port 8081):
+
+```
+http://localhost:8081/api/v1/registrations
+```
+
+### Repeatability
+
+- The pipeline writes the launched process PID to `<DEPLOY_DIR>\app.pid`.
+- On every re-run it reads the PID file and kills the old process, then checks the port via `netstat` to catch any process started outside Jenkins.
+- This prevents duplicate `java -jar` processes.
+
+### Troubleshooting
+
+| Symptom | Likely cause | Fix |
+| --- | --- | --- |
+| Build stage fails with compile error | Source incompatibility or missing dependency | Check Maven output in Jenkins console; ensure JDK 17 is active. |
+| Build stage: test failure | Application context cannot start | Confirm `src/test/resources/application-test.yml` activates the H2 profile. |
+| Package stage fails — JAR not found | `mvn clean verify` did not produce the JAR | Confirm `pom.xml` packaging is `jar` (default) and `spring-boot-maven-plugin` is present. |
+| Deploy stage: port never LISTENING | App crashed on startup | Read `<DEPLOY_DIR>\app.log` and `app.log.err`; likely a DB connectivity issue — check `DB_URL`, `DB_USERNAME`, `DB_PASSWORD` in Jenkins environment. |
+| Deploy stage: `java` not found | JDK not on agent PATH | Add JDK `bin` dir to the system PATH or configure a JDK tool in **Manage Jenkins → Tools**. |
+| `mvn` not found | Maven not on agent PATH | Add Maven `bin` dir to PATH or configure a Maven tool in **Manage Jenkins → Tools**. |
+| Port already in use (not by this app) | Another service occupies the port | Change `DEPLOY_PORT` to a free port before running the pipeline. |
 
 ## Contributing
 
@@ -190,4 +275,3 @@ See `CONTRIBUTING.md` for branch naming, commit message conventions, and pull re
 ## License
 
 Not yet selected. A `LICENSE` file will be added once the project owner chooses a license.
-njenkins CI trigger verification
