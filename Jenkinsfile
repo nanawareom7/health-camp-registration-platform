@@ -1,32 +1,16 @@
 // ============================================================================
 // Jenkinsfile — Health Camp Registration and Deployment Platform
-// Declarative pipeline (Windows agents)
+// Declarative Pipeline (Windows agents: LocalSystem service account)
 //
-// Parameters
-//   DEPLOY_PORT  — HTTP port the application will listen on (default: 8081)
-//   DEPLOY_DIR   — Local directory to copy the JAR into before launching
-//
-// Environment variables to configure in Jenkins (Manage Jenkins → Credentials
-// or Global properties → Environment variables). Never hard-coded here:
-//   DB_URL        — JDBC connection string for MySQL
-//   DB_USERNAME   — Database username
-//   DB_PASSWORD   — Database password
-//
-// ─── PROCESS SURVIVAL ON WINDOWS AGENTS ─────────────────────────────────────
-// Jenkins on Windows terminates processes spawned during builds when a build
-// finishes via its Process Tree Killer. To ensure the deployed background
-// Spring Boot service survives past the completion of the Jenkins pipeline:
-//   1. JENKINS_NODE_COOKIE and BUILD_ID are set to 'dontKillMe' in the Deploy
-//      stage environment and passed into PowerShell.
-//   2. PowerShell's `Start-Process` is executed with `-PassThru`, working directory,
-//      and redirected stdout/stderr to start an independent background process.
-//
-// ─── HEALTH CHECK STRATEGY ──────────────────────────────────────────────────
-// The application exposes REST endpoints under /api/v1/registrations.
-// Spring Boot DispatcherServlet responds to HTTP requests on this path.
-// During startup, curl.exe polls http://localhost:<port>/api/v1/registrations.
-// Any valid HTTP response code (100–599) confirms that Tomcat has bound the port
-// and the DispatcherServlet is operational.
+// Continuous Delivery & Deployment Architecture:
+//   Stage 1: Checkout              — SCM pull from branch */development
+//   Stage 2: Docker Diagnostic     — Verify Docker CLI and daemon access from LocalSystem
+//   Stage 3: Test & Build          — Maven compile, JUnit 5 + Selenium tests, publish Surefire XML
+//   Stage 4: Package Verification  — Verify built Spring Boot executable JAR exists
+//   Stage 5: Docker Build          — Multi-stage build with immutable tag build-${BUILD_NUMBER}
+//   Stage 6: Docker Push           — Authenticate via dockerhub-creds and publish to Docker Hub
+//   Stage 7: Deploy (JAR Port 8081)— Preserves original standalone JAR deployment (Task 8)
+//   Stage 8: Docker Deploy (8082)  — Deploy container to port 8082 with automated rollback
 // ============================================================================
 
 pipeline {
@@ -37,24 +21,39 @@ pipeline {
         string(
             name: 'DEPLOY_PORT',
             defaultValue: '8081',
-            description: 'HTTP port on which the application will listen after deployment.'
+            description: 'HTTP port for original standalone Spring Boot JAR deployment.'
         )
         string(
             name: 'DEPLOY_DIR',
             defaultValue: 'C:\\Jenkins\\deployments\\health-camp',
-            description: 'Local Windows directory where the JAR will be copied and run from.'
+            description: 'Local Windows directory where the standalone JAR is copied and run from.'
+        )
+        string(
+            name: 'DOCKER_PORT',
+            defaultValue: '8082',
+            description: 'Host port for continuous deployment Docker container.'
+        )
+        string(
+            name: 'DB_USER',
+            defaultValue: 'root',
+            description: 'MySQL database username.'
         )
     }
 
     environment {
-        JAR_NAME     = 'health-camp-registration-platform-0.0.1-SNAPSHOT.jar'
-        JAR_PATH     = "target\\${JAR_NAME}"
-        STARTUP_WAIT = '60'
+        // Prepend Docker CLI path for Windows Jenkins service account (LocalSystem)
+        DOCKER_BIN_DIR = 'C:\\Users\\Asus\\AppData\\Local\\Programs\\DockerDesktop\\resources\\bin'
+        PATH           = "${env.DOCKER_BIN_DIR};${env.PATH}"
+        JAR_NAME       = 'health-camp-registration-platform-0.0.1-SNAPSHOT.jar'
+        JAR_PATH       = "target\\${JAR_NAME}"
+        DOCKER_REPO    = 'nanawareom7/health-camp-registration'
+        CONTAINER_NAME = 'health-camp-app-cd'
+        STARTUP_WAIT   = '60'
     }
 
     options {
         buildDiscarder(logRotator(numToKeepStr: '10'))
-        timeout(time: 20, unit: 'MINUTES')
+        timeout(time: 25, unit: 'MINUTES')
         timestamps()
     }
 
@@ -72,41 +71,123 @@ pipeline {
         }
 
         // ─────────────────────────────────────────────────────────────────────
-        // Stage 2 — Build (compile + test)
+        // Stage 2 — Docker Environment Diagnostic
         // ─────────────────────────────────────────────────────────────────────
-        stage('Build') {
+        stage('Docker Diagnostic') {
             steps {
-                echo '==> Running mvn clean verify (compiles + JUnit 5 tests against H2)'
+                echo '==> Verifying Docker CLI path and daemon access from Jenkins LocalSystem context...'
+                bat '''
+                    @echo off
+                    echo [1/3] Checking Docker executable on PATH:
+                    where docker
+                    if errorlevel 1 (
+                        echo ERROR: docker.exe not found on PATH! Verify DOCKER_BIN_DIR configuration.
+                        exit /b 1
+                    )
+                    echo.
+                    echo [2/3] Verifying Docker client and daemon engine versions:
+                    docker version
+                    if errorlevel 1 (
+                        echo ERROR: docker version failed! Docker daemon is unreachable from LocalSystem context.
+                        exit /b 1
+                    )
+                    echo.
+                    echo [3/3] Verifying Docker system info:
+                    docker info
+                    if errorlevel 1 (
+                        echo ERROR: docker info failed!
+                        exit /b 1
+                    )
+                '''
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────────────────
+        // Stage 3 — Test & Build (compile + JUnit 5 & Selenium tests)
+        // ─────────────────────────────────────────────────────────────────────
+        stage('Test & Build') {
+            steps {
+                echo '==> Running mvn clean verify (compiles + unit & Selenium tests against H2)'
                 bat 'mvn clean verify --batch-mode --no-transfer-progress'
             }
             post {
+                always {
+                    echo '==> Publishing JUnit / Surefire test reports (strict: allowEmptyResults = false)...'
+                    junit allowEmptyResults: false, testResults: 'target/surefire-reports/*.xml'
+                }
                 failure {
-                    echo 'BUILD FAILED — check Maven output for compile errors or test failures.'
+                    echo 'BUILD FAILED — Tests failed or compile errors encountered. Halting pipeline to prevent deployment.'
                 }
             }
         }
 
         // ─────────────────────────────────────────────────────────────────────
-        // Stage 3 — Package verification
+        // Stage 4 — Package Verification
         // ─────────────────────────────────────────────────────────────────────
-        stage('Package') {
+        stage('Package Verification') {
             steps {
-                echo "==> Verifying JAR exists: ${env.JAR_PATH}"
+                echo "==> Verifying built JAR exists: ${env.JAR_PATH}"
                 bat """
                     IF NOT EXIST "%WORKSPACE%\\${env.JAR_PATH}" (
                         echo ERROR: JAR not found at %WORKSPACE%\\${env.JAR_PATH}
                         exit /b 1
                     )
-                    echo JAR verified:
                     dir "%WORKSPACE%\\${env.JAR_PATH}"
                 """
             }
         }
 
         // ─────────────────────────────────────────────────────────────────────
-        // Stage 4 — Deploy
+        // Stage 5 — Docker Build (Ahead of Deployment)
         // ─────────────────────────────────────────────────────────────────────
-        stage('Deploy') {
+        stage('Docker Build') {
+            steps {
+                script {
+                    def imageTag  = "${env.DOCKER_REPO}:build-${env.BUILD_NUMBER}"
+                    def latestTag = "${env.DOCKER_REPO}:latest"
+                    echo "==> Building Docker image: ${imageTag} and ${latestTag}"
+                    bat "docker build -t \"${imageTag}\" -t \"${latestTag}\" ."
+                }
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────────────────
+        // Stage 6 — Docker Push (Ahead of Deployment)
+        // ─────────────────────────────────────────────────────────────────────
+        stage('Docker Push') {
+            steps {
+                script {
+                    def imageTag  = "${env.DOCKER_REPO}:build-${env.BUILD_NUMBER}"
+                    def latestTag = "${env.DOCKER_REPO}:latest"
+                    echo "==> Authenticating to Docker Hub via credential 'dockerhub-creds'..."
+                    withCredentials([usernamePassword(
+                        credentialsId: 'dockerhub-creds',
+                        usernameVariable: 'DH_USER',
+                        passwordVariable: 'DH_PASS'
+                    )]) {
+                        bat '''
+                            @echo off
+                            echo Logging in to Docker Hub as %DH_USER%...
+                            echo %DH_PASS% | docker login -u %DH_USER% --password-stdin
+                            if errorlevel 1 (
+                                echo ERROR: Docker Hub authentication failed!
+                                exit /b 1
+                            )
+                        '''
+                        echo "==> Pushing immutable version: ${imageTag}"
+                        bat "docker push \"${imageTag}\""
+                        echo "==> Pushing floating tag: ${latestTag}"
+                        bat "docker push \"${latestTag}\""
+                        bat 'docker logout'
+                    }
+                }
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────────────────
+        // Stage 7 — Deploy (Standalone JAR Port 8081) — Preserved from Task 8
+        // ─────────────────────────────────────────────────────────────────────
+        stage('Deploy (JAR Port 8081)') {
             environment {
                 JENKINS_NODE_COOKIE = 'dontKillMe'
                 BUILD_ID            = 'dontKillMe'
@@ -118,180 +199,278 @@ pipeline {
                     def jarName    = env.JAR_NAME
                     def jarSrc     = "${env.WORKSPACE}\\${env.JAR_PATH}"
                     def jarDest    = "${deployDir}\\${jarName}"
+                    def launchBat  = "${deployDir}\\launch.bat"
                     def logFile    = "${deployDir}\\app.log"
                     def logFileErr = "${deployDir}\\app-err.log"
                     def pidFile    = "${deployDir}\\app.pid"
 
-                    // ── 4-a Ensure deployment directory exists ────────────────
-                    echo "==> Creating deployment directory (if needed): ${deployDir}"
+                    echo "==> Creating deployment directory: ${deployDir}"
                     bat "IF NOT EXIST \"${deployDir}\" mkdir \"${deployDir}\""
 
-                    // ── 4-b Stop any existing instance ───────────────────────
-                    //
-                    // Checks app.pid and netstat listeners on deployPort.
-                    // Only terminates processes positively verified as this application
-                    // to prevent killing unrelated system or user services.
-                    echo "==> Stopping any previous instance on port ${deployPort}"
-                    powershell """
-\$port    = [int]${deployPort}
-\$pidFile = '${pidFile}'
-\$jarName = '${jarName}'
+                    echo "==> Stopping any previous standalone instance on port ${deployPort}"
+                    withEnv([
+                        "TARGET_PORT=${deployPort}",
+                        "TARGET_PID_FILE=${pidFile}",
+                        "TARGET_JAR=${jarName}"
+                    ]) {
+                        powershell(script: '''
+                            $port    = [int]$env:TARGET_PORT
+                            $pidFile = $env:TARGET_PID_FILE
+                            $jarName = $env:TARGET_JAR
 
-# Stop by recorded PID file if it exists and belongs to Java
-if (Test-Path \$pidFile) {
-    \$stored = (Get-Content \$pidFile -Raw).Trim()
-    if (\$stored -match '^[0-9]+\$') {
-        \$oldPid = [int]\$stored
-        \$p = Get-Process -Id \$oldPid -ErrorAction SilentlyContinue
-        if (\$p -and \$p.Name -eq 'java') {
-            Write-Host "Stopping previous java.exe PID \$oldPid from pid file"
-            Stop-Process -Id \$oldPid -Force -ErrorAction SilentlyContinue
-            Start-Sleep -Seconds 2
-        }
-    }
-    Remove-Item \$pidFile -Force -ErrorAction SilentlyContinue
-}
+                            if (Test-Path $pidFile) {
+                                $stored = (Get-Content $pidFile -Raw).Trim()
+                                if ($stored -match '^[0-9]+$') {
+                                    $oldPid = [int]$stored
+                                    $p = Get-Process -Id $oldPid -ErrorAction SilentlyContinue
+                                    if ($p -and $p.Name -eq 'java') {
+                                        Write-Host "Stopping previous java.exe PID $oldPid from pid file"
+                                        Stop-Process -Id $oldPid -Force -ErrorAction SilentlyContinue
+                                        Start-Sleep -Seconds 2
+                                    }
+                                }
+                                Remove-Item $pidFile -Force -ErrorAction SilentlyContinue
+                            }
 
-# Cross-check listening processes on configured port
-\$listeners = netstat -ano | Select-String ("TCP.*:\$port\\s.*LISTEN")
-foreach (\$line in \$listeners) {
-    if (\$line.Line -match '([0-9]+)\$') {
-        \$netPid = [int]\$Matches[1]
-        \$proc = Get-Process -Id \$netPid -ErrorAction SilentlyContinue
-        if (\$proc) {
-            \$cim = Get-CimInstance Win32_Process -Filter "ProcessId = \$netPid" -ErrorAction SilentlyContinue
-            \$isOurApp = (\$cim -and \$cim.CommandLine -like "*\$jarName*")
-            if (\$isOurApp) {
-                Write-Host "Stopping verified previous instance java.exe PID \$netPid on port \$port"
-                Stop-Process -Id \$netPid -Force -ErrorAction SilentlyContinue
-                Start-Sleep -Seconds 2
-            } else {
-                Write-Error "Port \$port is occupied by PID \$netPid ('\$(\$proc.Name)') which is NOT this application. Aborting to avoid terminating an unrelated process."
-                exit 1
-            }
-        }
-    }
-}
-Write-Host "Port \$port is clear."
-"""
+                            $listeners = netstat -ano | Select-String ("TCP.*:$port\\s.*LISTEN")
+                            foreach ($line in $listeners) {
+                                if ($line.Line -match '([0-9]+)$') {
+                                    $netPid = [int]$Matches[1]
+                                    $proc = Get-Process -Id $netPid -ErrorAction SilentlyContinue
+                                    if ($proc) {
+                                        $cim = Get-CimInstance Win32_Process -Filter "ProcessId = $netPid" -ErrorAction SilentlyContinue
+                                        if ($cim -and $cim.CommandLine -like "*$jarName*") {
+                                            Write-Host "Stopping verified previous instance java.exe PID $netPid on port $port"
+                                            Stop-Process -Id $netPid -Force -ErrorAction SilentlyContinue
+                                            Start-Sleep -Seconds 2
+                                        }
+                                    }
+                                }
+                            }
+                            Write-Host "Port $port is clear."
+                        ''')
+                    }
 
-                    // ── 4-c Copy the freshly built JAR ───────────────────────
-                    echo "==> Copying JAR to deployment directory"
+                    echo "==> Copying JAR to ${jarDest}"
                     bat "copy /Y \"${jarSrc}\" \"${jarDest}\""
 
-                    // ── 4-d Launch Spring Boot application via Start-Process ─
-                    echo "==> Launching Spring Boot application via PowerShell Start-Process"
-                    powershell """
-\$deployDir  = '${deployDir}'
-\$jarDest    = '${jarDest}'
-\$logFile    = '${logFile}'
-\$logFileErr = '${logFileErr}'
-\$pidFile    = '${pidFile}'
-\$port       = ${deployPort}
+                    echo "==> Launching standalone Spring Boot service in background"
+                    withEnv([
+                        "DEPLOY_DIR=${deployDir}",
+                        "JAR_DEST=${jarDest}",
+                        "LAUNCH_BAT=${launchBat}",
+                        "LOG_FILE=${logFile}",
+                        "LOG_ERR=${logFileErr}",
+                        "DEPLOY_PORT=${deployPort}"
+                    ]) {
+                        powershell(script: '''
+                            $deployDir  = $env:DEPLOY_DIR
+                            $jarDest    = $env:JAR_DEST
+                            $launchBat  = $env:LAUNCH_BAT
+                            $logFile    = $env:LOG_FILE
+                            $logFileErr = $env:LOG_ERR
+                            $port       = $env:DEPLOY_PORT
 
-# Instruct Jenkins Process Tree Killer to spare this background process
-\$env:JENKINS_NODE_COOKIE = 'dontKillMe'
-\$env:BUILD_ID            = 'dontKillMe'
+                            if (Test-Path $logFile)    { Move-Item $logFile    "$logFile.prev"    -Force }
+                            if (Test-Path $logFileErr) { Move-Item $logFileErr "$logFileErr.prev" -Force }
 
-# Build argument array for java.exe
-\$javaArgs = @(
-    '-jar',
-    "`"\$jarDest`"",
-    "--server.port=\$port"
-)
-if (\$env:DB_URL)      { \$javaArgs += "--spring.datasource.url=\$(\$env:DB_URL)" }
-if (\$env:DB_USERNAME) { \$javaArgs += "--spring.datasource.username=\$(\$env:DB_USERNAME)" }
-if (\$env:DB_PASSWORD) { \$javaArgs += "--spring.datasource.password=\$(\$env:DB_PASSWORD)" }
+                            $argsStr = "-jar `"$jarDest`" --server.port=$port"
+                            if ($env:DB_URL)      { $argsStr += " --spring.datasource.url=`"$($env:DB_URL)`"" }
+                            if ($env:DB_USERNAME) { $argsStr += " --spring.datasource.username=`"$($env:DB_USERNAME)`"" }
+                            if ($env:DB_PASSWORD) { $argsStr += " --spring.datasource.password=`"$($env:DB_PASSWORD)`"" }
 
-# Rotate previous logs for fresh inspection
-if (Test-Path \$logFile)    { Move-Item \$logFile    "\$logFile.prev"    -Force }
-if (Test-Path \$logFileErr) { Move-Item \$logFileErr "\$logFileErr.prev" -Force }
+                            $batScript = "@echo off`r`njava $argsStr > `"$logFile`" 2> `"$logFileErr`""
+                            [System.IO.File]::WriteAllText($launchBat, $batScript, [System.Text.Encoding]::ASCII)
 
-Write-Host "Launching application in background:"
-Write-Host "  Executable : java"
-Write-Host "  Arguments  : \$javaArgs"
-Write-Host "  Directory  : \$deployDir"
-Write-Host "  Stdout log : \$logFile"
-Write-Host "  Stderr log : \$logFileErr"
+                            $proc = Start-Process -FilePath "cmd.exe" -ArgumentList "/c `"$launchBat`"" -WorkingDirectory $deployDir -WindowStyle Hidden -PassThru
+                            if (-not ($proc -and $proc.Id)) {
+                                throw "Failed to start background launch process."
+                            }
+                        ''')
+                    }
 
-\$proc = Start-Process -FilePath "java" -ArgumentList \$javaArgs -WorkingDirectory \$deployDir -RedirectStandardOutput \$logFile -RedirectStandardError \$logFileErr -PassThru
+                    echo "==> Bounded health check on http://localhost:${deployPort}/..."
+                    withEnv([
+                        "DEPLOY_PORT=${deployPort}",
+                        "STARTUP_WAIT=${env.STARTUP_WAIT}",
+                        "PID_FILE=${pidFile}",
+                        "LOG_FILE=${logFile}",
+                        "LOG_ERR=${logFileErr}"
+                    ]) {
+                        powershell(script: '''
+                            $port     = [int]$env:DEPLOY_PORT
+                            $maxWait  = [int]$env:STARTUP_WAIT
+                            $interval = 3
+                            $elapsed  = 0
+                            $ready    = $false
+                            $appPid   = 0
 
-if (\$proc -and \$proc.Id) {
-    \$newPid = \$proc.Id
-    \$newPid | Out-File \$pidFile -Encoding ASCII -Force
-    Write-Host "Application successfully started with PID \$newPid (recorded in \$pidFile)"
-} else {
-    throw "Start-Process failed to launch the application or did not return a valid Process ID."
-}
-"""
+                            while ($elapsed -lt $maxWait) {
+                                Start-Sleep -Seconds $interval
+                                $elapsed += $interval
 
-                    // ── 4-e Bounded health-check ──────────────────────────────
-                    echo "==> Waiting up to ${env.STARTUP_WAIT}s for application to respond on port ${deployPort}..."
-                    powershell """
-\$port      = [int]${deployPort}
-\$maxWait   = [int]${env.STARTUP_WAIT}
-\$interval  = 3
-\$elapsed   = 0
-\$logFile   = '${logFile}'
-\$logErr    = '${logFileErr}'
-\$pidFile   = '${pidFile}'
-\$ready     = \$false
+                                $listeners = netstat -ano | Select-String ("TCP.*:$port\\s.*LISTEN")
+                                foreach ($line in $listeners) {
+                                    if ($line.Line -match '([0-9]+)$') {
+                                        $netPid = [int]$Matches[1]
+                                        if ($netPid -gt 0 -and $netPid -ne $appPid) {
+                                            $appPid = $netPid
+                                            $appPid | Out-File $env:PID_FILE -Encoding ASCII -Force
+                                        }
+                                    }
+                                }
 
-\$appPid = 0
-if (Test-Path \$pidFile) {
-    \$raw = (Get-Content \$pidFile -Raw).Trim()
-    if (\$raw -match '^[0-9]+\$') { \$appPid = [int]\$raw }
-}
+                                $curlOut = & curl.exe -s -o NUL -w "%{http_code}" --max-time 4 --connect-timeout 3 "http://localhost:$port/" 2>&1
+                                if ($LASTEXITCODE -eq 0 -and $curlOut -eq "200") {
+                                    Write-Host "  HTTP 200 OK received on port $port — Standalone UI is operational."
+                                    $ready = $true
+                                    break
+                                }
+                                Write-Host "  Waiting for standalone app ($elapsed / $maxWait s)..."
+                            }
 
-while (\$elapsed -lt \$maxWait) {
-    Start-Sleep -Seconds \$interval
-    \$elapsed += \$interval
-
-    # Fail fast if process terminated prematurely
-    if (\$appPid -gt 0) {
-        \$alive = Get-Process -Id \$appPid -ErrorAction SilentlyContinue
-        if (-not \$alive) {
-            Write-Host "Process PID \$appPid has exited - application terminated prematurely."
-            break
+                            if (-not $ready) {
+                                Write-Host "--- stdout log ---"
+                                if (Test-Path $env:LOG_FILE) { Get-Content $env:LOG_FILE -Tail 50 }
+                                Write-Host "--- stderr log ---"
+                                if (Test-Path $env:LOG_ERR)  { Get-Content $env:LOG_ERR  -Tail 20 }
+                                throw "Standalone app failed readiness check on port $port."
+                            }
+                        ''')
+                    }
+                }
+            }
         }
-    }
 
-    # Query real application endpoint
-    \$curlOut = & curl.exe -s -o NUL -w "%{http_code}" --max-time 4 --connect-timeout 3 "http://localhost:\$port/api/v1/registrations" 2>&1
-    if (\$LASTEXITCODE -eq 0 -and \$curlOut -match '^[1-5][0-9]{2}\$') {
-        Write-Host "  HTTP \$curlOut received from http://localhost:\$port/api/v1/registrations - application is active."
-        \$ready = \$true
-        break
-    }
+        // ─────────────────────────────────────────────────────────────────────
+        // Stage 8 — Docker Deploy (Container Port 8082 with Automated Rollback)
+        // ─────────────────────────────────────────────────────────────────────
+        stage('Docker Deploy (8082)') {
+            steps {
+                script {
+                    def imageTag      = "${env.DOCKER_REPO}:build-${env.BUILD_NUMBER}"
+                    def containerName = env.CONTAINER_NAME
+                    def hostPort      = params.DOCKER_PORT?.trim() ?: env.DOCKER_PORT
+                    def dbUser        = params.DB_USER?.trim() ?: 'root'
 
-    Write-Host "  ... waiting for application (\$elapsed / \$maxWait s) [last response: exit=\$LASTEXITCODE code='\$curlOut']"
-}
+                    echo "==> Deploying container '${containerName}' using image '${imageTag}' on host port ${hostPort}..."
+                    withCredentials([string(
+                        credentialsId: 'mysql-password',
+                        variable: 'MYSQL_PWD_SECRET'
+                    )]) {
+                        withEnv([
+                            "DEPLOY_CONTAINER=${containerName}",
+                            "DEPLOY_IMAGE=${imageTag}",
+                            "DEPLOY_PORT=${hostPort}",
+                            "DEPLOY_DB_USER=${dbUser}",
+                            "STARTUP_WAIT=${env.STARTUP_WAIT}"
+                        ]) {
+                            powershell(script: '''
+                                $container = $env:DEPLOY_CONTAINER
+                                $image     = $env:DEPLOY_IMAGE
+                                $port      = [int]$env:DEPLOY_PORT
+                                $dbUser    = $env:DEPLOY_DB_USER
+                                $maxWait   = [int]$env:STARTUP_WAIT
 
-if (-not \$ready) {
-    Write-Host ""
-    Write-Host "=============================================="
-    Write-Host " APPLICATION FAILED TO BECOME REACHABLE"
-    Write-Host "=============================================="
-    Write-Host "--- stdout log (last 60 lines) ---"
-    if (Test-Path \$logFile) { Get-Content \$logFile -Tail 60 }
-    Write-Host "--- stderr log (last 30 lines) ---"
-    if (Test-Path \$logErr)  { Get-Content \$logErr  -Tail 30 }
-    throw "Application did not respond on http://localhost:\$port within \$maxWait seconds."
-}
+                                # 1. Record previously running image for automated rollback if needed
+                                $prevImage = ""
+                                $running = docker ps --filter "name=^${container}$" --format "{{.Image}}"
+                                if ($running) {
+                                    $prevImage = $running.Trim()
+                                    Write-Host "Recorded active previous container image for rollback: $prevImage"
+                                    docker stop $container
+                                    docker rm $container
+                                } else {
+                                    # Check exited container with same name
+                                    $exited = docker ps -a --filter "name=^${container}$" --format "{{.ID}}"
+                                    if ($exited) { docker rm $container }
+                                }
 
-Write-Host ""
-Write-Host "=============================================="
-Write-Host " DEPLOYMENT SUCCESSFUL"
-Write-Host " Base URL : http://localhost:\$port/"
-Write-Host " API      : http://localhost:\$port/api/v1/registrations"
-Write-Host " Log      : ${logFile}"
-Write-Host "=============================================="
-"""
+                                Write-Host "Launching candidate container '$container' with image '$image' on port $port..."
+                                $env:DB_PASSWORD = $env:MYSQL_PWD_SECRET
+
+                                docker run -d `
+                                    --name $container `
+                                    -p "${port}:8080" `
+                                    -e SERVER_PORT=8080 `
+                                    -e DB_URL="jdbc:mysql://host.docker.internal:3306/health_camp_db?useSSL=false&serverTimezone=UTC&allowPublicKeyRetrieval=true" `
+                                    -e "DB_USERNAME=$dbUser" `
+                                    -e DB_PASSWORD `
+                                    $image
+
+                                $env:DB_PASSWORD = $null
+
+                                if ($LASTEXITCODE -ne 0) {
+                                    throw "Failed to launch candidate container."
+                                }
+
+                                # 2. Bounded readiness probe on http://localhost:<port>/
+                                Write-Host "Verifying candidate container readiness on http://localhost:${port}/..."
+                                $interval = 3
+                                $elapsed  = 0
+                                $ready    = $false
+
+                                while ($elapsed -lt $maxWait) {
+                                    Start-Sleep -Seconds $interval
+                                    $elapsed += $interval
+
+                                    $curlOut = & curl.exe -s -o NUL -w "%{http_code}" --max-time 4 --connect-timeout 3 "http://localhost:$port/" 2>&1
+                                    if ($LASTEXITCODE -eq 0 -and $curlOut -eq "200") {
+                                        Write-Host "  HTTP 200 OK received from http://localhost:$port/ — Candidate Registration UI verified operational!"
+                                        $ready = $true
+                                        break
+                                    }
+                                    Write-Host "  Waiting for container readiness ($elapsed / $maxWait s)..."
+                                }
+
+                                # 3. Rollback handling if candidate fails readiness check
+                                if (-not $ready) {
+                                    Write-Host ""
+                                    Write-Host "=============================================="
+                                    Write-Host " CANDIDATE READINESS FAILED — INITIATING ROLLBACK"
+                                    Write-Host "=============================================="
+                                    Write-Host "--- Candidate Container Logs ---"
+                                    docker logs --tail 60 $container
+
+                                    docker stop $container
+                                    docker rm $container
+
+                                    if ($prevImage -and $prevImage -ne "") {
+                                        Write-Host "Restoring previous working image: $prevImage..."
+                                        $env:DB_PASSWORD = $env:MYSQL_PWD_SECRET
+                                        docker run -d `
+                                            --name $container `
+                                            -p "${port}:8080" `
+                                            -e SERVER_PORT=8080 `
+                                            -e DB_URL="jdbc:mysql://host.docker.internal:3306/health_camp_db?useSSL=false&serverTimezone=UTC&allowPublicKeyRetrieval=true" `
+                                            -e "DB_USERNAME=$dbUser" `
+                                            -e DB_PASSWORD `
+                                            $prevImage
+                                        $env:DB_PASSWORD = $null
+                                        Write-Host "Previous working container restored."
+                                    } else {
+                                        Write-Host "No previous working image was active to restore."
+                                    }
+
+                                    throw "Candidate container failed readiness check on port $port."
+                                }
+
+                                Write-Host ""
+                                Write-Host "=============================================="
+                                Write-Host " DOCKER CD DEPLOYMENT SUCCESSFUL"
+                                Write-Host " Container : $container"
+                                Write-Host " Image     : $image"
+                                Write-Host " URL       : http://localhost:$port/"
+                                Write-Host " API       : http://localhost:$port/api/v1/registrations"
+                                Write-Host "=============================================="
+                            ''')
+                        }
+                    }
                 }
             }
             post {
                 failure {
-                    echo 'DEPLOY FAILED — see PowerShell output and application log above for details.'
+                    echo 'DOCKER DEPLOY FAILED — Candidate failed readiness check. Automated rollback was executed if previous image existed.'
                 }
             }
         }
@@ -299,13 +478,13 @@ Write-Host "=============================================="
 
     post {
         always {
-            echo "Pipeline result: ${currentBuild.currentResult}"
+            echo "Pipeline completed with result: ${currentBuild.currentResult}"
         }
         success {
-            echo "SUCCESS — Spring Boot running on http://localhost:${params.DEPLOY_PORT}/"
+            echo "SUCCESS — Standalone (port ${params.DEPLOY_PORT}) and Docker (port ${params.DOCKER_PORT ?: '8082'}) deployments verified."
         }
         failure {
-            echo 'FAILED — review stage logs above.'
+            echo 'FAILED — Review stage logs above.'
         }
     }
 }
