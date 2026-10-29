@@ -1,7 +1,9 @@
-# Prepared GitHub Issues
+# Prepared GitHub Issues (Backlog)
 ## Health Camp Registration and Deployment Platform
 
-> These are **prepared** issue contents for the MVP. They have **not** been created on GitHub yet (no remote is configured). Copy each block into a new GitHub issue once the repository is pushed.
+> These are **prepared** issue contents for the MVP. They have **not** been created on GitHub yet (no remote is configured). Each issue below now includes a **Verified completion status** reflecting what was actually implemented and tested (`mvn clean verify` — 19 tests, 0 failures).
+>
+> Legend: ✅ done · ⚠️ partial / refined · ❌ not done (planned)
 
 ---
 
@@ -11,24 +13,22 @@
 **Labels:** enhancement, feature
 
 ### Description
-Implement the participant registration flow (FR-1). A participant should be able to submit a registration for a health camp with required personal and contact details. The system must validate inputs, prevent duplicate registrations, and create the record in `PENDING` status.
+Implement the participant registration flow (FR-1). A participant submits a registration for a health camp with required personal and contact details. The system validates inputs and creates the record in `PENDING` status.
 
-This delivers the planned endpoint `POST /api/v1/registrations` (see `docs/api-documentation.md`) and the `Registration` / `Participant` entities (see `docs/data-model.md`).
+This delivers `POST /api/v1/registrations` (see `docs/api-documentation.md`).
 
-### Tasks
-- Add `Participant` and `Registration` JPA entities.
-- Add a `RegistrationService` with create + duplicate check.
-- Add `POST /api/v1/registrations` controller with Bean Validation.
-- Add unit tests for the service and an integration test for the endpoint (H2).
-- Persist registrations with status `PENDING`.
+### Verified completion status: Implemented ✅
+Verified by `RegistrationControllerTest` (3 tests) + `HealthCampApplicationTests` (context loads).
+
+**Deviation from original plan:** The implemented model is a single `Registration` entity with `fullName`, `email`, `phone`, `preferredCampDate`, `status`, `createdAt` — there is no `HealthCamp` entity, no `campId`, and no duplicate check. These remain planned (see Limitations in README).
 
 ### Acceptance criteria
-- [ ] `POST /api/v1/registrations` accepts a valid payload and returns `201` with a `PENDING` registration.
-- [ ] Missing/invalid required fields (name, email, phone, campId) return `400` with a clear validation error.
-- [ ] A duplicate registration (same participant email + camp) returns `409`.
-- [ ] Registering for a non-existent camp returns `404` (or `400`).
-- [ ] All new code is covered by JUnit 5 tests (service + web layer).
-- [ ] No secrets are committed; configuration uses environment variables.
+- [x] ✅ `POST /api/v1/registrations` accepts a valid payload and returns `201` with a `PENDING` registration.
+- [x] ✅ Missing/invalid required fields (`fullName`, `email`, `phone`, `preferredCampDate`) return `400` with a clear validation error. *(No `campId` in the simplified model.)*
+- [ ] ❌ A duplicate registration (same email + camp) returns `409` — **not implemented** (no camp concept; duplicates are currently allowed).
+- [ ] ❌ Registering for a non-existent camp returns `404`/`400` — **not applicable** (no camp entity).
+- [x] ✅ All new code is covered by JUnit 5 tests (web layer; `RegistrationControllerTest`).
+- [x] ✅ No secrets are committed; configuration uses environment variables.
 
 ---
 
@@ -38,24 +38,22 @@ This delivers the planned endpoint `POST /api/v1/registrations` (see `docs/api-d
 **Labels:** enhancement, feature
 
 ### Description
-Implement the organizer approval flow (FR-2). An organizer can view a registration and transition it from `PENDING` to `APPROVED` or `REJECTED`. On approval a confirmation is generated (notification is planned and may be logged in the MVP).
+Implement the organizer approval flow (FR-2). An organizer can view a registration and transition it from `PENDING` to `APPROVED` or `REJECTED`.
 
-This delivers the planned endpoints `GET /api/v1/registrations/{id}` and `PATCH /api/v1/registrations/{id}/status`.
+This delivers `GET /api/v1/registrations/{id}` and `PATCH /api/v1/registrations/{id}/status`.
 
-### Tasks
-- Add `RegistrationService` methods for status transition with validation of allowed transitions.
-- Add `GET /api/v1/registrations/{id}` and `PATCH /api/v1/registrations/{id}/status`.
-- Store an optional rejection reason.
-- On approval, generate a confirmation reference and (planned) log a notification.
-- Add JUnit 5 tests for transitions and error cases.
+### Verified completion status: Implemented (approval/rejection) ✅ ; confirmation not done ❌
+Verified by `RegistrationWorkflowTest` (15 tests, including approve/reject persistence and transition guards).
+
+**Refinement:** Invalid status **transitions** return `409 Conflict` (not `400`) — a conflict with the current resource state is the more appropriate HTTP semantics; `400` is used for malformed/invalid status **values**. See `docs/api-documentation.md` section 4.
 
 ### Acceptance criteria
-- [ ] `GET /api/v1/registrations/{id}` returns the registration or `404`.
-- [ ] `PATCH` with `APPROVED` moves a `PENDING` registration to `APPROVED` and returns `200`.
-- [ ] `PATCH` with `REJECTED` moves a `PENDING` registration to `REJECTED` and stores an optional reason.
-- [ ] Invalid transitions (e.g. approving an already-rejected registration) return `400`.
-- [ ] Approving beyond camp capacity is prevented (ties to FR-3.4) with a `409`.
-- [ ] Confirmation generation is covered by tests; notification is stubbed/logged if not implemented.
+- [x] ✅ `GET /api/v1/registrations/{id}` returns the registration or `404`.
+- [x] ✅ `PATCH` with `APPROVED` moves a `PENDING` registration to `APPROVED` and returns `200` (persisted).
+- [ ] ⚠️ `PATCH` with `REJECTED` moves a `PENDING` registration to `REJECTED` — rejection works and persists, but **an optional `reason` is not stored** (not implemented).
+- [x] ✅ Invalid transitions (e.g. approving an already-rejected/already-approved registration) are prevented — implemented as `409 Conflict` (refined from `400`; see note above).
+- [ ] ❌ Approving beyond camp capacity is prevented with `409` — **not implemented** (no camp/capacity).
+- [ ] ❌ Confirmation generation / notification is **not implemented** (no `CONFIRMED` state; notifications planned).
 
 ---
 
@@ -65,22 +63,34 @@ This delivers the planned endpoints `GET /api/v1/registrations/{id}` and `PATCH 
 **Labels:** enhancement, feature
 
 ### Description
-Implement participant listing and status tracking (FR-3). Organizers can list participants for a camp, view each registration's status, filter by status, and search by name. The system enforces camp capacity during approval.
+Implement participant listing and status tracking (FR-3). Organizers can list registrations, filter by status, and view each registration's current status.
 
-This delivers the planned endpoint `GET /api/v1/camps/{id}/participants`.
+### Verified completion status: Listing (global, with status filter) and status tracking implemented ✅ ; camp-based listing / search / pagination not done ❌
+Verified by `RegistrationWorkflowTest` (list-all, list-by-status, empty-filter, invalid-filter-400, get-by-id, get-404).
 
-### Tasks
-- Add a query/repository method to list registrations by camp with filters.
-- Add `GET /api/v1/camps/{id}/participants?status=&q=&page=&size=`.
-- Return paged results with the current status per registration.
-- Enforce capacity in the approval path (cross-link with Issue 2).
-- Add JUnit 5 tests for filtering, search, and pagination.
+**Deviation from original plan:** Listing is global at `GET /api/v1/registrations[?status=]`, not camp-based at `/api/v1/camps/{id}/participants`, because there is no `HealthCamp` entity. There is no `q` name search and no pagination.
 
 ### Acceptance criteria
-- [ ] `GET /api/v1/camps/{id}/participants` returns a paged list with `200`.
-- [ ] The `status` query filters by `PENDING`/`APPROVED`/`REJECTED`/`CONFIRMED`.
-- [ ] The `q` query searches participant names (case-insensitive).
-- [ ] Pagination (`page`, `size`) is respected and reflected in the response.
-- [ ] Approving a registration beyond camp capacity returns `409`.
-- [ ] Listing a non-existent camp returns `404`.
-- [ ] All new code is covered by JUnit 5 tests.
+- [ ] ⚠️ Listing returns a `200` list — **implemented** at `GET /api/v1/registrations[?status=]` (global, not camp-based; no pagination).
+- [x] ✅ The `status` query filters by `PENDING`/`APPROVED`/`REJECTED`. *(Filtering by `CONFIRMED` returns `400` — `CONFIRMED` is not implemented.)*
+- [ ] ❌ The `q` query searches participant names — **not implemented**.
+- [ ] ❌ Pagination (`page`, `size`) is respected — **not implemented** (full list returned).
+- [ ] ❌ Approving beyond camp capacity returns `409` — **not implemented** (no camp/capacity).
+- [ ] ❌ Listing a non-existent camp returns `404` — **not applicable** (no camp entity).
+- [x] ✅ All new code is covered by JUnit 5 tests (`RegistrationWorkflowTest`).
+
+---
+
+## Remaining backlog (new / derived from Task 6)
+
+These items were surfaced as limitations during Task 6 and are tracked for future work:
+
+- **Security:** Add authentication and role-based authorization (organizer/admin) to the listing, get-by-id, and status-update endpoints (currently demo-only/unprotected).
+- **Data model:** Introduce the `HealthCamp` entity and `campId`; switch listing to camp-based.
+- **Capacity:** Enforce camp capacity during approval (`409` when exceeded).
+- **Deduplication:** Prevent duplicate registrations per participant email + camp (`409`).
+- **Pagination & search:** Add `page`/`size` and `q` (name) search to listing.
+- **Confirmation:** Add the `CONFIRMED` state and notification (email/SMS or logged stub).
+- **Rejection reason:** Store an optional `reason` on rejection.
+- **Schema migrations:** Adopt Flyway/Liquibase instead of manual DDL + `ddl-auto: none`.
+- **CI/CD:** Run `mvn verify` on pushes/PRs; container build and deploy (see `docs/deployment.md`).

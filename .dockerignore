@@ -1,0 +1,12 @@
+# .dockerignore for Health Camp Registration Platform
+target/
+.git
+.gitignore
+.idea/
+*.iml
+.vscode/
+docs/
+*.md
+.env
+.env.*
+
